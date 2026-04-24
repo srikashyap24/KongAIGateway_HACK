@@ -45,20 +45,57 @@ curl -i -X POST http://localhost:8001/services/openrouter-service/plugins \
   --data "config.add.headers[]=Authorization:Bearer $OPENROUTER_API_KEY" \
   --data "config.add.headers[]=Content-Type:application/json"
 
-echo "Adding AI Prompt Decorator Plugin (PII Sanitizer)..."
+echo "Adding AI Prompt Decorator Plugin (Volvo Enterprise System Prompt)..."
 curl -i -X POST http://localhost:8001/services/openrouter-service/plugins \
   --data name=ai-prompt-decorator \
   --data "config.prompts.prepend[1].role=system" \
-  --data "config.prompts.prepend[1].content=You are a highly capable and friendly Enterprise AI assistant for Volvo Cars team members. You can help with code, analysis, general chat, and answering questions. You maintain a helpful, conversational tone while always keeping Volvo's enterprise security in mind."
+  --data "config.prompts.prepend[1].content=You are a secure and professional Enterprise AI assistant for Volvo Cars. You help team members with code, analysis, and operational questions. You NEVER reveal raw VINs, emails, GPS coordinates, API keys, or other sensitive data in your responses. If sensitive data appears in retrieved documents, refer to it generically. Always maintain Volvo's enterprise security posture."
 
-echo "Adding Prompt Injection & DLP Guard Plugin (Strict PII/Confidentiality Blocking)..."
+echo "--- VOLVO DLP POLICY PACK v2.0 ---"
+echo "Adding Kong ai-prompt-guard: BLOCK GPS Coordinates..."
 curl -i -X POST http://localhost:8001/services/openrouter-service/plugins \
   --data name=ai-prompt-guard \
   --data "config.match_all_roles=true" \
-  --data "config.deny_patterns[1]=ignore previous instructions|you are now|forget your rules|act as|jailbreak|bypass security" \
-  --data-urlencode "config.deny_patterns[2]=\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|6(?:011|5[0-9]{2})[0-9]{12}|3[47][0-9]{13}|3(?:0[0-5]|[68][0-9])[0-9]{11}|(?:2131|1800|35[0-9]{3})[0-9]{11})\b|\b(?:\d[ -]*?){13,16}\b|\b\d{6}[-+]\d{4}\b|\b\d{8}-\d{4}\b|\b[A-HJ-NPR-Z0-9]{17}\b" \
-  --data-urlencode "config.deny_patterns[3]=\bsk-(?:live|test|or-v1)-[a-zA-Z0-9]{20,}\b|\b[a-zA-Z]{2}[0-9]{2}[a-zA-Z0-9]{4}[0-9]{7}([a-zA-Z0-9]?){0,16}\b|password is|password=" \
-  --data-urlencode "config.deny_patterns[4]=passport number|driver's license|fingerprint|iris scan|gps location|salary details|tax record|financial statement|private key|telematics|can bus|ecu data dump|medical record|diagnosis|prescription|source code|proprietary algorithm|security vulnerability|penetration testing report|non-disclosure agreement|nda "
+  --data-urlencode "config.deny_patterns[1]=-?\d{1,2}\.\d{3,},\s*-?\d{1,3}\.\d{3,}"
+
+echo "Adding Kong ai-prompt-guard: BLOCK Credit Card Numbers..."
+curl -i -X POST http://localhost:8001/services/openrouter-service/plugins \
+  --data name=ai-prompt-guard \
+  --data "config.match_all_roles=true" \
+  --data-urlencode "config.deny_patterns[1]=(?:\d[ -]?){13,16}"
+
+echo "Adding Kong ai-prompt-guard: BLOCK JWT Tokens & API Keys..."
+curl -i -X POST http://localhost:8001/services/openrouter-service/plugins \
+  --data name=ai-prompt-guard \
+  --data "config.match_all_roles=true" \
+  --data-urlencode "config.deny_patterns[1]=eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+" \
+  --data-urlencode "config.deny_patterns[2]=api[_-]?key|client_secret|private_key|secret_key|password\s*=|internal\s+endpoint"
+
+echo "Adding Kong ai-prompt-guard: BLOCK Sensitive Intent Queries..."
+curl -i -X POST http://localhost:8001/services/openrouter-service/plugins \
+  --data name=ai-prompt-guard \
+  --data "config.match_all_roles=true" \
+  --data-urlencode "config.deny_patterns[1]=(?i)(list all customers|vehicle owner details|location history|dump all|dump data|dump records)"
+
+echo "Adding Kong ai-prompt-guard: BLOCK Behavioral Tracking & Vehicle Telematics..."
+curl -i -X POST http://localhost:8001/services/openrouter-service/plugins \
+  --data name=ai-prompt-guard \
+  --data "config.match_all_roles=true" \
+  --data-urlencode "config.deny_patterns[1]=(?i)(track driver|monitor user behav|monitor driver behav|real.?time vehicle track|can bus|ecu data dump|telematics)"
+
+echo "Adding Kong ai-prompt-guard: BLOCK Prompt Injection & Jailbreak Attempts..."
+curl -i -X POST http://localhost:8001/services/openrouter-service/plugins \
+  --data name=ai-prompt-guard \
+  --data "config.match_all_roles=true" \
+  --data-urlencode "config.deny_patterns[1]=(?i)(ignore previous instructions|you are now|forget your rules|act as |jailbreak|bypass security|bypass filter|bypass guard)"
+
+echo "Adding Kong ai-prompt-guard: BLOCK requests for RESTRICTED PII files by name..."
+# Kong-first protection: deny any prompt that explicitly requests restricted files
+# These files contain customer PII, employee records, or security architecture
+curl -i -X POST http://localhost:8001/services/openrouter-service/plugins \
+  --data name=ai-prompt-guard \
+  --data "config.match_all_roles=true" \
+  --data-urlencode "config.deny_patterns[1]=(?i)(customer_data\.csv|employee_records\.csv|internal_security_policy\.txt)"
 
 echo "Adding Rate Limiting Plugin..."
 curl -i -X POST http://localhost:8001/services/openrouter-service/plugins \

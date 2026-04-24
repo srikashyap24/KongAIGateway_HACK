@@ -10,8 +10,276 @@ import json
 import asyncio
 import glob
 import os
+import re
 from datetime import datetime
 from typing import Optional
+
+# ══════════════════════════════════════════════════════════════════════
+# VOLVO ENTERPRISE DLP POLICY PACK
+# Enforced on BOTH input (user prompts) and output (AI responses)
+# Policy: volvo-enterprise-dlp v2.1
+# ══════════════════════════════════════════════════════════════════════
+
+# ── MASK patterns: replace value with REDACTED ─────────────────────────
+_MASK_RULES = [
+    # Vehicle Telemetry ID  (VEH-123456)
+    (re.compile(r'\bVEH-[0-9]{6,12}\b'),                                           "Volvo Vehicle Telemetry ID"),
+    # VIN  (17-char chassis number, excludes I/O/Q)
+    (re.compile(r'\b[A-HJ-NPR-Z0-9]{17}\b'),                                        "Vehicle Identification Number (VIN)"),
+    # Swedish personnummer — long form YYYYMMDD-XXXX  e.g. 20240504-1234
+    (re.compile(r'\b\d{8}[-+]\d{4}\b'),                                             "Swedish Personal ID number (personnummer)"),
+    # Swedish personnummer — short form YYMMDD-XXXX  e.g. 900101-1234
+    (re.compile(r'\b\d{6}[-+]\d{4}\b'),                                             "Swedish Personal ID number (personnummer, short)"),
+    # Email
+    (re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b'),         "Email address"),
+    # Phone (E.164 style, 7-15 digits)
+    (re.compile(r'\+?[1-9]\d{6,14}\b'),                                             "Phone number"),
+    # EU license plate  (e.g. ABC 123, XY-1234)
+    (re.compile(r'\b[A-Z]{2,3}[\- ]?[A-Z0-9]{3,4}\b'),                             "Vehicle license plate"),
+    # IPv4
+    (re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b'),                                    "IP address"),
+    # Driver license (generic alphanumeric 6-15 chars)
+    (re.compile(r'\b[A-Z]{1,3}[0-9]{5,12}\b'),                                      "Driver license number"),
+    # --- IMPROVED FINANCIAL REDACTION ---
+    # Currency with full amounts (captures SEK 4,200,000.00 etc)
+    (re.compile(r'(?:SEK|USD|EUR|\$|€|¥)\s*\b\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2})?\b'), "Currency amount"),
+    # Large numbers / financial figures (captures 4,200,000 or 1234567)
+    (re.compile(r'\b\d{1,3}(?:[,\s]\d{3})+(?:\.\d{2})?\b'),                         "Financial number"),
+    # Any 5+ digit number (fallback for unscreened IDs or large values)
+    (re.compile(r'\b\d{5,}\b'),                                                      "Large numerical value"),
+    # Partial budget patterns (fallback)
+    (re.compile(r'\b\d+(?:,\d{3})*\b'),                                              "General budget number"),
+    # SSN-like patterns (XXX-XX-XXXX)
+    (re.compile(r'\b\d{3}-\d{2}-\d{4}\b'),                                          "Social Security Number"),
+    # UUID/GUID patterns
+    (re.compile(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b', re.I), "System UUID"),
+    # JWT/Bearer tokens (long base64-like strings)
+    (re.compile(r'\beyJ[A-Za-z0-9\-_.]+\.([A-Za-z0-9\-_]+\.)?[A-Za-z0-9\-_]+\b'),  "JWT Token"),
+    # API Keys (alphanumeric strings 32+ chars that look like credentials)
+    (re.compile(r'\b[a-zA-Z0-9]{32,}\b'),                                           "Potential API key/credential"),
+    # Bank account numbers (IBAN or similar)
+    (re.compile(r'\b[A-Z]{2}\d{2}(?:\s?\d{4}){2,}(?:\s?\d{1,4})?\b'),              "Bank account (IBAN)"),
+]
+
+# ── BLOCK patterns: entire request is rejected ─────────────────────────
+_BLOCK_RULES = [
+    (
+        re.compile(r'\b\d{8}[-+]\d{4}\b|\b\d{6}[-+]\d{4}\b'),
+        "Swedish Personal Identity Number (personnummer)",
+        "The prompt contains a Swedish Personal Identity Number (personnummer) in the format YYYYMMDD-XXXX "
+        "or YYMMDD-XXXX (e.g. 20240504-1234). This is a national identifier and falls under GDPR "
+        "Special Category data. Sharing Swedish personnummer with an AI model is strictly prohibited "
+        "under Volvo's Privacy Policy and Swedish GDPR implementation (Dataskyddslagen). "
+        "Kong AI Gateway has blocked this request to prevent identity data from reaching the LLM."
+    ),
+    (
+        re.compile(r'\b-?\d{1,2}\.\d{3,},\s*-?\d{1,3}\.\d{3,}\b'),
+        "GPS/location coordinates",
+        "The prompt contains GPS coordinates. Sharing or logging real-time location data "
+        "is prohibited under the Volvo Privacy Policy and GDPR Article 5. Location data "
+        "is classified as high-risk PII and is always BLOCKED to prevent driver tracking."
+    ),
+    (
+        re.compile(r'\b(?:\d[ \-]?){13,16}\b'),
+        "Credit card number",
+        "The prompt contains what appears to be a credit card number. Payment card data "
+        "is strictly prohibited in AI prompts per PCI-DSS compliance. Kong AI Gateway has "
+        "blocked this request before it reached the LLM to prevent financial data exposure."
+    ),
+    (
+        re.compile(r'\beyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\b'),
+        "JWT authentication token",
+        "The prompt contains a JWT or bearer token. Embedding authentication credentials "
+        "in AI prompts is a critical security risk — it could expose session tokens to the LLM "
+        "provider. Kong DLP has blocked this request to prevent credential leakage."
+    ),
+    (
+        re.compile(r'(?i)(api[_\-]?key|client_secret|private_key|secret_key|password\s*=|internal\s+endpoint)'),
+        "API key / internal credential / secret",
+        "The prompt attempts to include an API key, secret, or reference to an internal endpoint. "
+        "Secrets must never be sent to an LLM. Kong DLP blocked this to protect Volvo's "
+        "internal infrastructure from accidental credential exposure."
+    ),
+    (
+        re.compile(r'(?i)(list\s+all\s+customers|vehicle\s+owner\s+details|location\s+history|dump\s+(all|data|records))'),
+        "Sensitive bulk-data intent query",
+        "The prompt requests bulk customer records or location history. This type of query "
+        "violates Volvo's data minimisation principle (GDPR Art. 5(1)(c)) and RBAC policy. "
+        "Only authorised analytics dashboards may access aggregated data — not AI chat."
+    ),
+    (
+        re.compile(r'(?i)(track\s+driver|monitor\s+(user|driver)\s+behav|real[\-\s]?time\s+vehicle\s+track|can\s+bus|ecu\s+data\s+dump|telematics)'),
+        "Behavioral tracking or vehicle telematics exfiltration",
+        "The prompt attempts to access driver behaviour patterns, CAN-bus data, or ECU telemetry. "
+        "Real-time tracking and raw vehicle data are proprietary automotive IP. Kong has blocked "
+        "this request to prevent industrial espionage and protect driver privacy."
+    ),
+    (
+        re.compile(r'(?i)(ignore\s+previous\s+instructions|you\s+are\s+now|forget\s+your\s+rules|act\s+as\s+|jailbreak|bypass\s+(security|filter|guard))'),
+        "Prompt injection / jailbreak attempt",
+        "The prompt contains language patterns consistent with a prompt injection or jailbreak attack "
+        "(e.g. 'ignore previous instructions', 'act as'). Kong's ai-prompt-guard plugin detected "
+        "this attempt to override security rules and blocked it before reaching Gemini."
+    ),
+]
+
+# ── HIGH-RISK CORRELATION: VIN + Name + Location together → BLOCK ──────
+def _high_risk_correlation(text: str) -> bool:
+    has_vin  = bool(re.search(r'\b[A-HJ-NPR-Z0-9]{17}\b', text))
+    has_loc  = bool(re.search(r'\b-?\d{1,2}\.\d{3,},\s*-?\d{1,3}\.\d{3,}\b', text))
+    has_name = bool(re.search(r'(?i)(name|driver|customer|owner)\s*[:\.=]?\s*[A-Z][a-z]+ [A-Z][a-z]+', text))
+    return has_vin and has_loc and has_name
+
+def mask_sensitive_data(text: str) -> str:
+    """Apply MASK rules to replace identifiers with REDACTED (used on both input and output)."""
+    if not text:
+        return text
+    for pattern, _ in _MASK_RULES:
+        text = pattern.sub('[REDACTED]', text)
+    return text
+
+def check_block_policy(text: str) -> Optional[str]:
+    """
+    Check BLOCK rules. Returns a human-readable block explanation string,
+    or None if the text is clean and should be allowed through.
+    """
+    if not text:
+        return None
+
+    # High-risk correlation check first (VIN + Name + Location together)
+    if _high_risk_correlation(text):
+        return (
+            "HIGH-RISK CORRELATION DETECTED — This prompt simultaneously contains a Vehicle VIN, "
+            "a person's name, and GPS location data. Combining these identifiers creates a unique "
+            "individual profile that is classified as Special Category data under GDPR. "
+            "Kong has escalated this to an immediate BLOCK to prevent de-anonymisation of Volvo customers."
+        )
+
+    for pattern, label, explanation in _BLOCK_RULES:
+        if pattern.search(text):
+            return explanation
+
+    return None  # Clean — allow through
+
+def identify_block_reason(text: str) -> str:
+    """Legacy helper: returns a short reason label (used for log entries)."""
+    result = check_block_policy(text)
+    if result:
+        # Return first sentence only for log labels
+        return result.split('.')[0]
+    # Fallback: check mask-only violations for context
+    found = [label for pattern, label in _MASK_RULES if pattern.search(text)]
+    if found:
+        return f"Prompt contained maskable PII: {', '.join(found)}"
+    return "Unidentified prohibited content — prompt injection or policy violation"
+
+
+# ═══════════════════════════════════════════════════════════════
+# VOLVO RBAC — Data Access Clusters (3 tiers)
+#
+# DEVELOPER cluster  → public + operational data, no PII
+# ADMIN cluster      → developer files + internal strategic data (no PII)
+# RESTRICTED         → never served, blocked at MCP + Kong layers
+# ═══════════════════════════════════════════════════════════════
+
+# Tier 1: Developer cluster (public, operational, non-sensitive)
+DEVELOPER_FILES = {
+    "vehicle_specs.csv",       # Model specs — public operational data
+    "service_logs.csv",        # Service work orders — operational, non-PII IDs only
+    "public_policies.txt",     # Public-facing policies
+}
+
+# Tier 2: Admin-only cluster (internal strategic, no personal PII)
+# Admins see DEVELOPER_FILES + these
+ADMIN_ONLY_FILES = {
+    "fleet_analytics_report.txt",   # Aggregated fleet stats, no individual PII
+    "maintenance_budget_q1.txt",    # Internal finance/budget data
+    "supplier_contracts_summary.txt", # Commercial supplier data
+    "rd_roadmap_2024.txt",          # Strategic R&D project status
+}
+
+ADMIN_FILES = DEVELOPER_FILES | ADMIN_ONLY_FILES  # Union: all accessible files
+
+# Tier 3: Restricted — blocked at MCP server level + Kong ai-prompt-guard
+# Listed here for documentation. Python NEVER exposes these.
+RESTRICTED_FILES_DOC = {
+    "customer_data.csv",            # Personal PII — GDPR Special Category
+    "employee_records.csv",         # HR/salary data — GDPR Special Category
+    "internal_security_policy.txt", # Operational security risk
+}
+
+ROLE_LABELS = {
+    "developer": "Developer (Tier 1 — public + operational data)",
+    "admin":     "Administrator (Tier 1+2 — includes internal strategic data)",
+}
+
+# ── Keywords for detecting admin-only file requests ──
+ADMIN_FILE_KEYWORDS = {
+    "fleet analytics": "fleet_analytics_report.txt",
+    "fleet analytics report": "fleet_analytics_report.txt",
+    "maintenance budget": "maintenance_budget_q1.txt",
+    "q1 budget": "maintenance_budget_q1.txt",
+    "budget breakdown": "maintenance_budget_q1.txt",
+    "supplier contract": "supplier_contracts_summary.txt",
+    "supplier contracts": "supplier_contracts_summary.txt",
+    "r&d project": "rd_roadmap_2024.txt",
+    "rd project": "rd_roadmap_2024.txt",
+    "r&d roadmap": "rd_roadmap_2024.txt",
+    "rd roadmap": "rd_roadmap_2024.txt",
+    "2024 roadmap": "rd_roadmap_2024.txt",
+    "r&d 2024": "rd_roadmap_2024.txt",
+}
+
+def detect_admin_file_request(prompt: str) -> tuple[bool, str]:
+    """
+    Detect if user is asking about admin-only files.
+    Returns (is_admin_request, filename_hint)
+    """
+    prompt_lower = prompt.lower()
+    for keyword, filename in ADMIN_FILE_KEYWORDS.items():
+        if keyword in prompt_lower:
+            return True, filename
+    return False, ""
+
+def rbac_filter_list(content: str, role: str) -> str:
+    """Filter list_available_files output based on role."""
+    allowed = ADMIN_FILES if role == "admin" else DEVELOPER_FILES
+    lines = content.split("\n")
+    filtered = [l for l in lines
+                if not l.startswith("- ") or l[2:].strip() in allowed]
+    return "\n".join(filtered)
+
+def rbac_filter_fetch(content: str, role: str) -> str:
+    """Filter fetch_documents output to only include role-allowed files."""
+    allowed = ADMIN_FILES if role == "admin" else DEVELOPER_FILES
+    sections = content.split("\n\n")
+    result = []
+    for sec in sections:
+        if not sec.startswith("--- File:"):
+            result.append(sec)
+            continue
+        first_line = sec.split("\n")[0]
+        fname = first_line.replace("--- File:", "").replace("---", "").strip()
+        if fname in allowed:
+            result.append(sec)
+        else:
+            # STRICT DENIAL MESSAGE FOR DEVELOPERS (Requirement: everytime it should say you donot have admin acess)
+            if role == "developer" and fname in ADMIN_ONLY_FILES:
+                result.append(
+                    f"--- File: {fname} ---\n"
+                    f"⛔ ACCESS DENIED: You do not have Admin access. This dataset is restricted to Administrator roles only."
+                )
+            else:
+                tier = "Admin" if fname in ADMIN_ONLY_FILES else "Restricted"
+                result.append(
+                    f"--- File: {fname} ---\n"
+                    f"[ACCESS DENIED — {tier.upper()} TIER] "
+                    f"Your current role ({role.upper()}) does not have permission to view this file. "
+                    f"{'Request Admin access to view internal strategic datasets.' if tier == 'Admin' else 'This file contains classified PII and is blocked for all AI access by Volvo Security Policy.'}"
+                )
+    return "\n\n".join(result)
+
+
 
 app = FastAPI(title="Volvo DNS TAPIR Security Dashboard")
 
@@ -35,6 +303,7 @@ class DNSQuery(BaseModel):
 
 class PromptQuery(BaseModel):
     message: str
+    role: Optional[str] = "developer"  # "developer" | "admin"
 
 @app.post("/api/analyze")
 async def analyze_dns(query: DNSQuery):
@@ -42,28 +311,41 @@ async def analyze_dns(query: DNSQuery):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     message = f"Analyze this DNS query: user {query.username} from IP {query.user_ip} visited {query.domain}. Provide threat assessment."
     try:
+        # ── Volvo DLP pre-flight block check ──
+        block_reason = check_block_policy(message)
+        if block_reason:
+            elapsed = round((time.time() - start_time) * 1000)
+            log_entry = {"timestamp": timestamp, "domain": query.domain, "user_ip": "[REDACTED]",
+                         "username": "[REDACTED]", "threat_level": "BLOCKED",
+                         "reason": block_reason[:120], "latency_ms": elapsed, "status": "blocked"}
+            query_logs.append(log_entry)
+            return {"threat_level": "BLOCKED",
+                    "analysis": f"⛔ VOLVO DLP POLICY BLOCKED \u2014 {block_reason}",
+                    "latency_ms": elapsed, "sanitized": True}
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 KONG_URL,
-                json={"model": GEMINI_MODEL, "messages": [{"role": "user", "content": message}]},
+                json={"model": GEMINI_MODEL, "messages": [{"role": "user", "content": mask_sensitive_data(message)}]},
                 headers={"Content-Type": "application/json"}
             )
         elapsed = round((time.time() - start_time) * 1000)
         if response.status_code == 429:
-            log_entry = {"timestamp": timestamp, "domain": query.domain, "user_ip": query.user_ip,
-                         "username": query.username, "threat_level": "BLOCKED",
+            log_entry = {"timestamp": timestamp, "domain": query.domain, "user_ip": "[REDACTED]",
+                         "username": "[REDACTED]", "threat_level": "BLOCKED",
                          "reason": "Rate limit exceeded by Kong Gateway", "latency_ms": elapsed, "status": "rate_limited"}
             query_logs.append(log_entry)
             raise HTTPException(status_code=429, detail="Rate limit exceeded - Kong Gateway blocked this request")
         data = response.json()
         if "error" in data and "prompt pattern is blocked" in str(data.get("error", "")):
-            log_entry = {"timestamp": timestamp, "domain": query.domain, "user_ip": query.user_ip,
-                         "username": query.username, "threat_level": "BLOCKED",
-                         "reason": "Sensitive info / Malicious prompt blocked by Kong DLP", "latency_ms": elapsed, "status": "blocked"}
+            reason = identify_block_reason(message)
+            log_entry = {"timestamp": timestamp, "domain": query.domain, "user_ip": "[REDACTED]",
+                         "username": "[REDACTED]", "threat_level": "BLOCKED",
+                         "reason": reason, "latency_ms": elapsed, "status": "blocked"}
             query_logs.append(log_entry)
-            return {"threat_level": "BLOCKED", "analysis": "⛔ SENSITIVE DATA ALERT: Kong AI Gateway detected and blocked PII / Confidential Info before reaching the AI.",
+            return {"threat_level": "BLOCKED", "analysis": f"⛔ VOLVO DLP POLICY BLOCKED \u2014 {reason}.",
                     "latency_ms": elapsed, "sanitized": True}
-        ai_response = data["choices"][0]["message"]["content"]
+        ai_response = mask_sensitive_data(data["choices"][0]["message"]["content"])
         threat_level = "UNKNOWN"
         if "HIGH" in ai_response.upper(): threat_level = "HIGH"
         elif "MEDIUM" in ai_response.upper(): threat_level = "MEDIUM"
@@ -84,20 +366,29 @@ async def analyze_dns(query: DNSQuery):
 async def test_prompt_injection(query: PromptQuery):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
+        block_reason = check_block_policy(query.message)
+        if block_reason:
+            log_entry = {"timestamp": timestamp, "domain": "PROMPT_INJECTION_ATTEMPT", "user_ip": "[REDACTED]",
+                         "username": "[REDACTED]", "threat_level": "BLOCKED",
+                         "reason": block_reason[:120], "latency_ms": 0, "status": "blocked"}
+            query_logs.append(log_entry)
+            return {"blocked": True, "message": f"⛔ VOLVO DLP POLICY BLOCKED \u2014 {block_reason}"}
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 KONG_URL,
-                json={"model": GEMINI_MODEL, "messages": [{"role": "user", "content": query.message}]},
+                json={"model": GEMINI_MODEL, "messages": [{"role": "user", "content": mask_sensitive_data(query.message)}]},
                 headers={"Content-Type": "application/json"}
             )
         data = response.json()
         if "error" in data:
+            reason = identify_block_reason(query.message)
             log_entry = {"timestamp": timestamp, "domain": "PROMPT_INJECTION_ATTEMPT", "user_ip": "[REDACTED]",
                          "username": "[REDACTED]", "threat_level": "BLOCKED",
-                         "reason": "Prompt injection detected", "latency_ms": 0, "status": "blocked"}
+                         "reason": reason, "latency_ms": 0, "status": "blocked"}
             query_logs.append(log_entry)
-            return {"blocked": True, "message": "⛔ Kong AI Gateway blocked this malicious prompt!"}
-        return {"blocked": False, "message": data["choices"][0]["message"]["content"]}
+            return {"blocked": True, "message": f"⛔ VOLVO DLP POLICY BLOCKED \u2014 {reason}."}
+        ai_response = mask_sensitive_data(data["choices"][0]["message"]["content"])
+        return {"blocked": False, "message": ai_response}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -107,29 +398,36 @@ async def chat_with_ai(query: PromptQuery):
     start_time = time.time()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
+        # ── Volvo DLP pre-flight block check ──
+        block_reason = check_block_policy(query.message)
+        if block_reason:
+            elapsed = round((time.time() - start_time) * 1000)
+            return {"blocked": True, "message": f"⛔ VOLVO DLP POLICY BLOCKED \u2014 {block_reason}",
+                    "latency_ms": elapsed, "threat_level": "BLOCKED"}
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 KONG_URL,
-                json={"model": GEMINI_MODEL, "messages": [{"role": "user", "content": query.message}]},
+                json={"model": GEMINI_MODEL, "messages": [{"role": "user", "content": mask_sensitive_data(query.message)}]},
                 headers={"Content-Type": "application/json"}
             )
         elapsed = round((time.time() - start_time) * 1000)
         
         if response.status_code == 429:
-            return {"blocked": True, "message": "⛔ Rate limit exceeded - Kong Gateway blocked this request", "latency_ms": elapsed, "threat_level": "BLOCKED"}
+            return {"blocked": True, "message": "⛔ Rate limit exceeded — Kong Gateway blocked this request (max 5 requests/min per user)",
+                    "latency_ms": elapsed, "threat_level": "BLOCKED"}
             
         data = response.json()
         if "error" in data and "prompt pattern is blocked" in str(data.get("error", "")):
-            return {"blocked": True, "message": "⛔ SENSITIVE DATA ALERT: Kong AI Gateway detected and blocked PII / Confidential Info before reaching the AI.", "latency_ms": elapsed, "threat_level": "BLOCKED"}
+            reason = identify_block_reason(query.message)
+            return {"blocked": True, "message": f"⛔ VOLVO DLP POLICY BLOCKED \u2014 {reason}.",
+                    "latency_ms": elapsed, "threat_level": "BLOCKED"}
             
-        ai_response = data["choices"][0]["message"]["content"]
-        
-        # log it for stats
+        ai_response = mask_sensitive_data(data["choices"][0]["message"]["content"])
         log_entry = {"timestamp": timestamp, "domain": "CHAT_MESSAGE", "user_ip": "[REDACTED]",
                      "username": "[REDACTED]", "threat_level": "LOW", "analysis": ai_response,
                      "latency_ms": elapsed, "tokens_used": data.get("usage", {}).get("total_tokens", 0), "status": "analyzed"}
         query_logs.append(log_entry)
-        
         return {"blocked": False, "message": ai_response, "latency_ms": elapsed, "threat_level": "LOW"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -353,104 +651,177 @@ async def get_stats():
     }
 
 
-# ── MCP AGENT CHAT (Server-Sent Events) ──────────────────────────────────────
+# ══ MCP AGENT CHAT (Server-Sent Events) ═══════════════════════════════════════════════════════════════
 KONG_MCP_URL = "http://localhost:8000/mcp/sse"
 MAX_TOOL_LOOPS = 5
 
-async def agent_chat_stream(message: str):
+async def agent_chat_stream(message: str, role: str = "developer"):
     """Run the MCP agentic loop and stream each step as an SSE event."""
-    
+
     def evt(event: str, data: dict) -> str:
         return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+    role_label = ROLE_LABELS.get(role, role)
+    allowed_files = list(DEVELOPER_FILES) if role == "developer" else "all files"
 
     try:
         from mcp.client.sse import sse_client
         from mcp.client.session import ClientSession
 
-        yield evt("step", {"stage": "source", "msg": "Prompt received"})
-        yield evt("step", {"stage": "kong", "msg": "Kong AI Gateway — inspecting prompt..."})
+        yield evt("step", {"stage": "source", "msg": f"Prompt received — Role: {role.upper()}"})
+        yield evt("step", {"stage": "kong", "msg": "Kong DLP scan — running Volvo policy pack..."})
         await asyncio.sleep(0.3)
 
-        async with sse_client(KONG_MCP_URL) as streams:
-            async with ClientSession(streams[0], streams[1]) as mcp:
-                await mcp.initialize()
+        # ── Volvo DLP pre-flight block check ──
+        block_reason = check_block_policy(message)
+        if block_reason:
+            yield evt("blocked", {"msg": f"⛔ VOLVO DLP POLICY BLOCKED — {block_reason}"})
+            return
 
-                tools_response = await mcp.list_tools()
-                tool_names = [t.name for t in tools_response.tools]
-                llm_tools = [{
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.inputSchema
-                    }
-                } for t in tools_response.tools]
+        # ── RBAC pre-flight: Check if developer is requesting admin files ──
+        is_admin_req, filename_hint = detect_admin_file_request(message)
+        if is_admin_req and role == "developer":
+            yield evt("blocked", {
+                "msg": f"⛔ ACCESS DENIED: You do not have admin access to file '{filename_hint}'. "
+                       f"Only administrators can view this file. Your current role is: DEVELOPER."
+            })
+            return
 
-                yield evt("step", {"stage": "mcp_discover", "msg": f"MCP tools discovered: {', '.join(tool_names)}"})
+        try:
+            async with sse_client(KONG_MCP_URL) as streams:
+                async with ClientSession(streams[0], streams[1]) as mcp:
+                    await mcp.initialize()
 
-                system_prompt = (
-                    "You are a helpful Volvo data assistant. You have access to local dataset files via MCP tools.\n"
-                    "Before answering data questions, ALWAYS call list_available_files first, then fetch_documents. "
-                    "Do NOT write Python code blocks — use actual tool calls only."
-                )
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": message}
-                ]
+                    tools_response = await mcp.list_tools()
+                    tool_names = [t.name for t in tools_response.tools]
+                    llm_tools = [{
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.inputSchema
+                        }
+                    } for t in tools_response.tools]
 
-                async with httpx.AsyncClient(timeout=60.0) as http:
-                    for _ in range(MAX_TOOL_LOOPS):
-                        yield evt("step", {"stage": "kong", "msg": "Kong — routing to LLM (ai-proxy)..."})
+                    yield evt("step", {"stage": "mcp_discover", "msg": f"MCP tools discovered: {', '.join(tool_names)}"})
 
-                        resp = await http.post(
-                            KONG_URL,
-                            json={"model": GEMINI_MODEL, "messages": messages, "tools": llm_tools},
-                            headers={"Content-Type": "application/json"}
+                    # Build role-aware system prompt
+                    if role == "developer":
+                        access_note = (
+                            f"You have DEVELOPER access. You may ONLY reference these files: "
+                            f"{', '.join(sorted(DEVELOPER_FILES))}.\n"
+                            f"If asked about employee records, customer data, or internal security policies, "
+                            f"respond that those files require Admin access and are not available to your role."
                         )
-                        data = resp.json()
+                    else:
+                        access_note = (
+                            "You have ADMIN access. You may access ALL files including confidential datasets "
+                            "(employee records, customer data, internal security policies)."
+                        )
 
-                        if "error" in data:
-                            err_msg = data["error"].get("message", str(data["error"]))
-                            yield evt("blocked", {"msg": f"⛔ Kong blocked: {err_msg}"})
-                            return
+                    system_prompt = (
+                        f"You are a helpful and secure Enterprise AI assistant for Volvo Cars.\n"
+                        f"Current user role: {role_label}\n"
+                        f"{access_note}\n"
+                        "IMPORTANT SECURITY RULES:\n"
+                        "- Never reveal raw VINs, emails, phone numbers, GPS coordinates, or API keys in responses.\n"
+                        "- If you find sensitive data in documents, refer to it generically.\n"
+                        "- Always call list_available_files first, then fetch_documents.\n"
+                        "- Do NOT write Python or code blocks — use actual tool calls only.\n"
+                        "- Respond concisely and professionally as a Volvo enterprise assistant."
+                    )
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": mask_sensitive_data(message)}
+                    ]
 
-                        llm_msg = data["choices"][0].get("message", {})
+                    async with httpx.AsyncClient(timeout=60.0) as http:
+                        for _ in range(MAX_TOOL_LOOPS):
+                            yield evt("step", {"stage": "kong", "msg": "Kong — routing to LLM (ai-proxy)..."})
 
-                        # No more tool calls → final answer
-                        if not llm_msg.get("tool_calls"):
-                            yield evt("step", {"stage": "ai", "msg": "Gemini responded ✓"})
-                            yield evt("step", {"stage": "verdict", "msg": "Response delivered"})
-                            yield evt("answer", {"msg": llm_msg.get("content", "")})
-                            return
+                            resp = await http.post(
+                                KONG_URL,
+                                json={"model": GEMINI_MODEL, "messages": messages, "tools": llm_tools},
+                                headers={"Content-Type": "application/json"}
+                            )
+                            data = resp.json()
 
-                        messages.append(llm_msg)
+                            if "error" in data:
+                                err_msg = str(data["error"])
+                                if "prompt pattern is blocked" in err_msg:
+                                    reason = identify_block_reason(message)
+                                    yield evt("blocked", {"msg": f"⛔ VOLVO DLP POLICY BLOCKED — {reason}."})
+                                else:
+                                    display_msg = data["error"].get("message", err_msg) if isinstance(data["error"], dict) else err_msg
+                                    yield evt("blocked", {"msg": f"⛔ Kong gateway error: {display_msg}"})
+                                return
 
-                        for tc in llm_msg["tool_calls"]:
-                            fn = tc["function"]["name"]
-                            args = json.loads(tc["function"]["arguments"])
-                            yield evt("step", {"stage": "mcp_call", "msg": f"🛠 LLM called {fn}({args})"})
-                            yield evt("step", {"stage": "kong_mcp", "msg": "Kong — routing to MCP server..."})
+                            llm_msg = data["choices"][0].get("message", {})
 
-                            tool_result = await mcp.call_tool(fn, arguments=args)
-                            result_text = "\n".join(c.text for c in tool_result.content if c.type == "text")
+                            # No more tool calls → final answer
+                            if not llm_msg.get("tool_calls"):
+                                yield evt("step", {"stage": "ai", "msg": "Gemini responded ✓"})
+                                yield evt("step", {"stage": "verdict", "msg": "Response delivered"})
+                                final_text = mask_sensitive_data(llm_msg.get("content", ""))
+                                yield evt("answer", {"msg": final_text})
+                                return
 
-                            yield evt("step", {"stage": "mcp_result", "msg": f"MCP returned {len(result_text)} chars"})
+                            messages.append(llm_msg)
 
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tc["id"],
-                                "content": result_text,
-                                "name": fn
-                            })
+                            for tc in llm_msg["tool_calls"]:
+                                fn = tc["function"]["name"]
+                                args = json.loads(tc["function"]["arguments"])
+                                yield evt("step", {"stage": "mcp_call", "msg": f"🛠 LLM called {fn}({args})"})
+                                yield evt("step", {"stage": "kong_mcp", "msg": "Kong — routing to MCP server..."})
+
+                                tool_result = await mcp.call_tool(fn, arguments=args)
+                                result_text = "\n".join(c.text for c in tool_result.content if c.type == "text")
+
+                                # ── RBAC filter: redact files the role cannot access ──
+                                if fn == "list_available_files":
+                                    result_text = rbac_filter_list(result_text, role)
+                                elif fn == "fetch_documents":
+                                    result_text = rbac_filter_fetch(result_text, role)
+
+                                yield evt("step", {"stage": "mcp_result", "msg": f"MCP returned {len(result_text)} chars [{role.upper()} access]"})
+
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tc["id"],
+                                    "content": result_text,
+                                    "name": fn
+                                })
+
+                        yield evt("error", {"msg": "Reached max tool iterations without a final answer."})
+
+        except (ConnectionRefusedError, OSError, TimeoutError) as conn_err:
+            yield evt("error", {"msg":
+                f"⚠️ MCP Server is not running. Start it in a separate terminal:\n"
+                f"  source .venv/bin/activate && python mcp_server.py\n"
+                f"  (Error: {conn_err})"
+            })
+            return
+        except BaseException as eg:
+            # Catch Python 3.11+ ExceptionGroup from asyncio TaskGroup
+            err_name = type(eg).__name__
+            if "ExceptionGroup" in err_name or "TaskGroup" in str(eg):
+                yield evt("error", {"msg":
+                    "⚠️ Cannot connect to MCP Server — it may not be running.\n"
+                    "Start it in a separate terminal:\n"
+                    "  source .venv/bin/activate && python mcp_server.py"
+                })
+            else:
+                yield evt("error", {"msg": f"MCP error ({err_name}): {str(eg)[:200]}"})
+            return
 
     except Exception as e:
-        yield evt("error", {"msg": str(e)})
+        yield evt("error", {"msg": f"Gateway error: {str(e)[:300]}"})
 
 
 @app.post("/api/agent-chat")
 async def agent_chat(query: PromptQuery):
     return StreamingResponse(
-        agent_chat_stream(query.message),
+        agent_chat_stream(query.message, role=query.role or "developer"),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     )

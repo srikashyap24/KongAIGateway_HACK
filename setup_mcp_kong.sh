@@ -33,14 +33,17 @@ curl -s -X POST http://localhost:8001/services/mcp-service/routes \
   --data "protocols[]=http" \
   --data "protocols[]=https" || true
 
-# ── DLP: Regex PII guard on LLM route only ───────────────────────────────────
-DENY_PII="\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b|\b\d{3}[-.]?\d{3}[-.]?\d{4}\b|\b\d{8}-\d{4}\b"
+# ── DLP: Swedish Personnummer + PII guard on LLM route ────────────────────────
+# Swedish personnummer: YYYYMMDD-XXXX (long) or YYMMDD-XXXX (short), e.g. 20240504-1234
+DENY_PERSONNUMMER="\b\d{8}[-+]\d{4}\b|\b\d{6}[-+]\d{4}\b"
+DENY_PII="\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b|\b\d{3}[-.]?\d{3}[-.]?\d{4}\b"
 
-echo "Applying AI Prompt Guard (PII regex) to LLM route..."
+echo "Applying AI Prompt Guard (Personnummer block) to LLM route..."
 curl -s -X POST http://localhost:8001/routes/openrouter-route/plugins \
   --data name=ai-prompt-guard \
   --data "config.match_all_roles=true" \
-  --data-urlencode "config.deny_patterns[1]=${DENY_PII}" || true
+  --data-urlencode "config.deny_patterns[1]=${DENY_PERSONNUMMER}" \
+  --data-urlencode "config.deny_patterns[2]=${DENY_PII}" || true
 
 echo ""
 echo "✅ MCP Kong setup complete."
